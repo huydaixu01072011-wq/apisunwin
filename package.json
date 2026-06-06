@@ -1,0 +1,22 @@
+{
+  "name": "huydaixuvn-vip-ai",
+  "version": "1.0.0",
+  "description": "HuyDaiXuVN VIP Predictor System",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "sunwin",
+    "taixiu",
+    "predictor",
+    "api"
+  ],
+  "author": "HuyDaiXuVN",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.3"
+  }
+}
