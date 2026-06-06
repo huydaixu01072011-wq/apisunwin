@@ -12,25 +12,23 @@ app.use((req, res, next) => {
 
 const PORT = 5000;
 
-// Cấu hình WebSocket
+// --- CẤU HÌNH WEBSOCKET ---
 const WEBSOCKET_URL = "wss://websocket.azhkthg1.net/websocket?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhbW91bnQiOjAsInVzZXJuYW1lIjoiU0NfYXBpc3Vud2luMTIzIn0.hgrRbSV6vnBwJMg9ZFtbx3rRu9mX_hZMZ_m5gMNhkw0";
 const WS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Origin": "https://play.sun.win"
 };
 
-const RECONNECT_DELAY = 2000;
+const RECONNECT_DELAY = 1500;
 const PING_INTERVAL = 10000;
-const MAX_HISTORY = 100; // Tăng lên 100 để thuật toán có đủ data phân tích
+const MAX_HISTORY = 120; // Tăng data base cho thuật toán VIP
 
-// Biến lưu trữ trạng thái
+// --- BIẾN TRẠNG THÁI ---
 let apiResponseData = { phien_hien_tai: null, lich_su_phien: [] };
 let predictData = null;
-let currentSessionId = null;
-let lastSessionId = null;
+let latestSid = null; // Cập nhật liên tục ID phiên chính xác
 const sessionHistory = [];
 
-// Thống kê dự đoán
 let predictionStats = { total: 0, correct: 0, wrong: 0, history: [] };
 let pendingPrediction = null; 
 
@@ -47,54 +45,61 @@ const initialMessages = [
     [6, "MiniGame", "lobbyPlugin", { cmd: 10001 }]
 ];
 
-// --- THUẬT TOÁN DỰ ĐOÁN SIÊU VIP (PATTERN MATCHING) ---
-function predictNext(history) {
-    if (history.length < 5) {
-        return {
-            du_doan: Math.random() > 0.5 ? "Tài" : "Xỉu",
-            do_tin_cay: 50 // Chưa đủ data
-        };
+// --- THUẬT TOÁN DỰ ĐOÁN SIÊU VIP (ĐA LỚP) ---
+function predictNextVIP(history) {
+    if (history.length < 6) return { du_doan: "Chờ Data", do_tin_cay: 50 };
+
+    const results = history.map(x => x.ket_qua);
+    const last1 = results[results.length - 1];
+    const last2 = results[results.length - 2];
+    const last3 = results[results.length - 3];
+    const last4 = results[results.length - 4];
+
+    // Lớp 1: Nhận diện Cầu Bệt (Dài hơn 3 tay)
+    if (last1 === last2 && last2 === last3 && last3 === last4) {
+        return { du_doan: last1, do_tin_cay: 75 }; // Bám bệt
     }
 
-    const patternLength = 3; // Lấy 3 kết quả gần nhất làm mẫu
-    const recentPattern = history.slice(-patternLength).map(x => x.ket_qua).join('-');
+    // Lớp 2: Nhận diện Cầu 1-1 (Tài - Xỉu - Tài - Xỉu)
+    if (last1 !== last2 && last2 !== last3 && last3 !== last4) {
+        return { du_doan: last1 === 'Tài' ? 'Xỉu' : 'Tài', do_tin_cay: 70 }; // Bám cầu 1-1
+    }
 
-    let t_count = 0;
-    let x_count = 0;
+    // Lớp 3: Pattern Matching (Dựa trên chuỗi 3 kết quả gần nhất)
+    const patternLength = 3;
+    const recentPattern = results.slice(-patternLength).join('-');
+    let t_count = 0; let x_count = 0;
 
-    // Quét lại toàn bộ lịch sử xem chuỗi này từng xuất hiện chưa, và kết quả tiếp theo là gì
     for (let i = 0; i < history.length - patternLength; i++) {
-        const pattern = history.slice(i, i + patternLength).map(x => x.ket_qua).join('-');
+        const pattern = results.slice(i, i + patternLength).join('-');
         if (pattern === recentPattern) {
-            const nextResult = history[i + patternLength].ket_qua;
+            const nextResult = results[i + patternLength];
             if (nextResult === 'Tài') t_count++;
             if (nextResult === 'Xỉu') x_count++;
         }
     }
 
     const totalMatches = t_count + x_count;
-
-    if (totalMatches === 0) {
-        // Nếu chuỗi mới hoàn toàn, dự đoán dựa trên xu hướng đang nghiêng về bên nào trong 10 phiên gần nhất
-        const recentTai = history.slice(-10).filter(x => x.ket_qua === 'Tài').length;
-        return {
-            du_doan: recentTai >= 5 ? "Tài" : "Xỉu",
-            do_tin_cay: 55
-        };
+    if (totalMatches >= 2) {
+        const du_doan = t_count > x_count ? "Tài" : "Xỉu";
+        const do_tin_cay = Math.round((Math.max(t_count, x_count) / totalMatches) * 100);
+        return { du_doan, do_tin_cay: do_tin_cay < 55 ? 55 : do_tin_cay };
     }
 
-    const du_doan = t_count > x_count ? "Tài" : "Xỉu";
-    const do_tin_cay = Math.round((Math.max(t_count, x_count) / totalMatches) * 100);
-
-    return { du_doan, do_tin_cay: do_tin_cay < 50 ? 50 : do_tin_cay };
+    // Lớp 4: Fallback - Xu hướng tổng quan (Trend Analysis) 10 ván gần nhất
+    const recentTai = results.slice(-10).filter(r => r === 'Tài').length;
+    return {
+        du_doan: recentTai > 5 ? "Tài" : "Xỉu",
+        do_tin_cay: 55
+    };
 }
 
-// --- XỬ LÝ WEBSOCKET ---
+// --- QUẢN LÝ WEBSOCKET ---
 function heartbeat() {
     clearTimeout(heartbeatTimeout);
     heartbeatTimeout = setTimeout(() => {
-        console.log('[⚠️] Mất kết nối mạng (Socket treo), đang ép khởi động lại...');
-        if (ws) ws.terminate(); // Ép đóng để trigger event 'close' gọi kết nối lại
+        console.log('[⚠️] Không nhận được phản hồi (Treo), khởi động lại...');
+        if (ws) ws.terminate();
     }, PING_INTERVAL + 5000);
 }
 
@@ -107,50 +112,41 @@ function connectWebSocket() {
     ws = new WebSocket(WEBSOCKET_URL, { headers: WS_HEADERS });
 
     ws.on('open', () => {
-        console.log('[✅] WebSocket đã kết nối.');
-        heartbeat(); // Bắt đầu đếm ngược heartbeat
+        console.log('[✅] WebSocket đã kết nối thành công.');
+        heartbeat();
 
         initialMessages.forEach((msg, i) => {
             setTimeout(() => {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify(msg));
-                }
+                if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
             }, i * 600);
         });
 
         clearInterval(pingInterval);
         pingInterval = setInterval(() => {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.ping();
-            }
+            if (ws.readyState === WebSocket.OPEN) ws.ping();
         }, PING_INTERVAL);
     });
 
     ws.on('ping', heartbeat);
-    ws.on('pong', () => {
-        // console.log('[📶] Ping OK.');
-        heartbeat(); // Reset đếm ngược khi nhận pong
-    });
+    ws.on('pong', heartbeat);
 
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-
             if (!Array.isArray(data) || typeof data[1] !== 'object') return;
 
             const { cmd, sid, d1, d2, d3, gBB } = data[1];
 
-            if (cmd === 1008 && sid) {
-                currentSessionId = sid;
+            // FIX: Cập nhật latestSid ngay khi có tín hiệu, không đợi đến khi quay xí ngầu
+            if (sid) {
+                latestSid = sid; 
             }
 
             if (cmd === 1003 && gBB) {
                 if (!d1 || !d2 || !d3) return;
 
-                // Xử lý chống mất phiên
-                let activeSession = currentSessionId;
-                if (!activeSession && lastSessionId) activeSession = lastSessionId + 1;
-                lastSessionId = activeSession; // Lưu lại phiên cuối
+                // Nếu không có sid, dùng id cuối + 1 để tránh null
+                let activeSession = latestSid || (sessionHistory.length > 0 ? sessionHistory[sessionHistory.length - 1].phien + 1 : Date.now());
 
                 const total = d1 + d2 + d3;
                 const resultText = (total > 10) ? "Tài" : "Xỉu";
@@ -164,10 +160,13 @@ function connectWebSocket() {
                     ket_qua: resultText
                 };
 
-                sessionHistory.push(sessionData);
-                if (sessionHistory.length > MAX_HISTORY) sessionHistory.shift();
+                // Tránh lưu trùng lặp phiên (nếu server spam tin nhắn)
+                if (sessionHistory.length === 0 || sessionHistory[sessionHistory.length - 1].phien !== activeSession) {
+                    sessionHistory.push(sessionData);
+                    if (sessionHistory.length > MAX_HISTORY) sessionHistory.shift();
+                }
 
-                // --- KIỂM TRA DỰ ĐOÁN TRƯỚC ĐÓ ---
+                // --- KIỂM TRA DỰ ĐOÁN ---
                 if (pendingPrediction && pendingPrediction.phien === activeSession) {
                     predictionStats.total++;
                     const isCorrect = pendingPrediction.du_doan === resultText;
@@ -181,16 +180,15 @@ function connectWebSocket() {
                         trang_thai: isCorrect ? "✅ ĐÚNG" : "❌ SAI"
                     });
 
-                    // Giữ lại lịch sử 30 dự đoán gần nhất
-                    if (predictionStats.history.length > 30) predictionStats.history.pop();
+                    if (predictionStats.history.length > 50) predictionStats.history.pop(); // Giữ 50 lịch sử trên UI
                 }
 
-                // --- TẠO DỰ ĐOÁN CHO PHIÊN TỚI ---
-                const nextPhien = activeSession ? activeSession + 1 : "Đang cập nhật";
-                const prediction = predictNext(sessionHistory);
+                // --- TẠO DỰ ĐOÁN MỚI ---
+                const nextPhien = activeSession + 1;
+                const prediction = predictNextVIP(sessionHistory);
                 pendingPrediction = { phien: nextPhien, du_doan: prediction.du_doan };
 
-                // --- CẬP NHẬT DATA API ---
+                // --- CẬP NHẬT JSON API ---
                 apiResponseData = {
                     ...sessionData,
                     lich_su_phien: sessionHistory
@@ -208,68 +206,134 @@ function connectWebSocket() {
                     do_tin_cay: `${prediction.do_tin_cay}%`
                 };
                 
-                console.log(`[🎲] Phiên ${activeSession}: ${total} (${resultText}) | Tỉ lệ đúng/sai: ${predictionStats.correct}/${predictionStats.wrong}`);
-                currentSessionId = null; // Reset
+                console.log(`[🎲] Phiên ${activeSession}: ${total} (${resultText}) | Dự đoán tiếp: ${prediction.du_doan} (${prediction.do_tin_cay}%)`);
             }
         } catch (e) {
-            console.error('[❌] Lỗi xử lý message:', e.message);
+            console.error('[❌] Lỗi xử lý:', e.message);
         }
     });
 
-    ws.on('close', (code, reason) => {
-        console.log(`[🔌] Mất kết nối. Bắt đầu kết nối lại sau ${RECONNECT_DELAY}ms...`);
+    ws.on('close', () => {
+        console.log(`[🔌] Mất kết nối. Đang nối lại...`);
         clearTimeout(heartbeatTimeout);
         clearInterval(pingInterval);
         setTimeout(connectWebSocket, RECONNECT_DELAY);
     });
 
-    ws.on('error', (err) => {
-        console.error('[❌] Lỗi Socket:', err.message);
+    ws.on('error', () => {
         ws.terminate();
     });
 }
 
-// --- ROUTES ---
+// --- REST API ROUTES ---
 
-app.get('/sunlon', (req, res) => {
-    res.json(apiResponseData);
-});
+app.get('/sunlon', (req, res) => res.json(apiResponseData));
+app.get('/predict', (req, res) => predictData ? res.json(predictData) : res.json({ error: "Chưa đủ dữ liệu" }));
 
-app.get('/predict', (req, res) => {
-    if (!predictData) {
-        return res.json({ error: "Đang thu thập dữ liệu, vui lòng đợi..." });
-    }
-    res.json(predictData);
-});
-
+// --- GIAO DIỆN HTML /STATUS ---
 app.get('/status', (req, res) => {
     const winRate = predictionStats.total > 0 
         ? Math.round((predictionStats.correct / predictionStats.total) * 100) 
         : 0;
 
-    res.json({
-        thong_ke_he_thong: {
-            tong_du_doan: predictionStats.total,
-            du_doan_dung: predictionStats.correct,
-            du_doan_sai: predictionStats.wrong,
-            ti_le_thang: `${winRate}%`
-        },
-        lich_su_du_doan: predictionStats.history
-    });
+    let tableRows = predictionStats.history.map(item => `
+        <tr>
+            <td>#${item.phien}</td>
+            <td class="${item.du_doan === 'Tài' ? 'tai' : 'xiu'}">${item.du_doan}</td>
+            <td class="${item.thuc_te === 'Tài' ? 'tai' : 'xiu'}">${item.thuc_te}</td>
+            <td class="status ${item.trang_thai.includes('ĐÚNG') ? 'correct' : 'wrong'}">${item.trang_thai}</td>
+        </tr>
+    `).join('');
+
+    if(predictionStats.history.length === 0) {
+        tableRows = `<tr><td colspan="4" style="text-align:center; padding: 20px;">Hệ thống đang thu thập dữ liệu... Vui lòng chờ vài phiên.</td></tr>`;
+    }
+
+    const html = `
+    <!DOCTYPE html>
+    <html lang="vi">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Thống Kê VIP - Hệ Thống Dự Đoán</title>
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+            body { background-color: #121212; color: #ffffff; padding: 20px; }
+            .container { max-width: 800px; margin: 0 auto; }
+            h1 { text-align: center; color: #f39c12; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 1px; }
+            .stats-cards { display: flex; gap: 15px; margin-bottom: 30px; }
+            .card { background: #1e1e1e; padding: 20px; border-radius: 10px; flex: 1; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border: 1px solid #333; }
+            .card h3 { font-size: 14px; color: #aaaaaa; margin-bottom: 10px; }
+            .card .value { font-size: 28px; font-weight: bold; }
+            .text-green { color: #2ecc71; }
+            .text-red { color: #e74c3c; }
+            .text-blue { color: #3498db; }
+            .text-gold { color: #f1c40f; }
+            table { width: 100%; border-collapse: collapse; background: #1e1e1e; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+            thead { background: #2c3e50; }
+            th, td { padding: 15px; text-align: center; border-bottom: 1px solid #333; }
+            th { color: #f39c12; text-transform: uppercase; font-size: 14px; }
+            tr:hover { background: #2a2a2a; }
+            .tai { color: #3498db; font-weight: bold; }
+            .xiu { color: #e74c3c; font-weight: bold; }
+            .status.correct { color: #2ecc71; font-weight: bold; background: rgba(46, 204, 113, 0.1); border-radius: 5px; padding: 5px; }
+            .status.wrong { color: #e74c3c; font-weight: bold; background: rgba(231, 76, 60, 0.1); border-radius: 5px; padding: 5px; }
+            .auto-refresh { text-align: center; margin-top: 20px; font-size: 12px; color: #888; }
+        </style>
+        <script>
+            // Tự động reload trang mỗi 10 giây để cập nhật dữ liệu
+            setInterval(() => window.location.reload(), 10000);
+        </script>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎲 Thống Kê Thuật Toán VIP</h1>
+            
+            <div class="stats-cards">
+                <div class="card">
+                    <h3>Tổng Dự Đoán</h3>
+                    <div class="value text-blue">${predictionStats.total}</div>
+                </div>
+                <div class="card">
+                    <h3>Dự Đoán Đúng</h3>
+                    <div class="value text-green">${predictionStats.correct}</div>
+                </div>
+                <div class="card">
+                    <h3>Dự Đoán Sai</h3>
+                    <div class="value text-red">${predictionStats.wrong}</div>
+                </div>
+                <div class="card">
+                    <h3>Tỉ Lệ Thắng (Win Rate)</h3>
+                    <div class="value text-gold">${winRate}%</div>
+                </div>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Phiên Giao Dịch</th>
+                        <th>Dự Đoán</th>
+                        <th>Kết Quả Thực Tế</th>
+                        <th>Trạng Thái</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${tableRows}
+                </tbody>
+            </table>
+            
+            <div class="auto-refresh">🔄 Giao diện tự động cập nhật sau mỗi 10 giây</div>
+        </div>
+    </body>
+    </html>
+    `;
+
+    res.send(html);
 });
 
-app.get('/', (req, res) => {
-    res.send(`
-        <h2>🎯 Hệ thống API Tài Xỉu Siêu VIP</h2>
-        <ul>
-            <li><a href="/sunlon">/sunlon</a> - Dữ liệu phiên mới nhất và lịch sử (JSON)</li>
-            <li><a href="/predict">/predict</a> - Dự đoán kết quả phiên tiếp theo (JSON)</li>
-            <li><a href="/status">/status</a> - Thống kê hiệu suất thuật toán (JSON)</li>
-        </ul>
-    `);
-});
+app.get('/', (req, res) => res.send(`<p>Vào <a href="/status">/status</a> để xem UI thống kê.</p>`));
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[🌐] Server đang chạy tại cổng ${PORT}`);
+    console.log(`[🌐] Server chạy tại cổng ${PORT}`);
     connectWebSocket();
 });
