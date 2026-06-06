@@ -21,18 +21,18 @@ const WS_HEADERS = {
 
 const RECONNECT_DELAY = 1500;
 const PING_INTERVAL = 10000;
-const MAX_HISTORY = 150; // Tăng để AI học sâu hơn
+const MAX_HISTORY = 150;
 
 // --- BIẾN TRẠNG THÁI ---
 let apiResponseData = { phien_hien_tai: null, lich_su_phien: [] };
 let predictData = null;
-let latestSid = null;
 const sessionHistory = [];
+let lastProcessedSid = null; // Chống trùng lặp
 
 let predictionStats = { total: 0, correct: 0, wrong: 0, history: [] };
-let pendingPrediction = null; 
+let pendingPrediction = null; // { duDoan, cau, chienLuoc }
 
-// --- AI: Đánh giá hiệu suất từng chiến lược (online learning) ---
+// --- HIỆU SUẤT TỪNG CHIẾN LƯỢC (AI ONLINE LEARNING) ---
 const strategyPerformance = {
     'Bệt':      { correct: 0, total: 0 },
     '1-1':      { correct: 0, total: 0 },
@@ -40,9 +40,8 @@ const strategyPerformance = {
     'Markov3':  { correct: 0, total: 0 },
     'Xu hướng':{ correct: 0, total: 0 }
 };
-let nextStrategyPredictions = {}; // Lưu dự đoán của từng chiến lược cho phiên kế tiếp
+let nextStrategyPredictions = {}; // Lưu dự đoán tạm của từng chiến lược cho phiên vừa kết thúc
 
-// --- WEBSOCKET CONNECTION ---
 let ws = null;
 let pingInterval = null;
 let heartbeatTimeout = null;
@@ -56,29 +55,24 @@ const initialMessages = [
     [6, "MiniGame", "lobbyPlugin", { cmd: 10001 }]
 ];
 
-// --- TIỆN ÍCH NHẬN DIỆN CẦU ---
+// ============= THUẬT TOÁN NHẬN DIỆN CẦU =============
 function detectPattern(history) {
     if (history.length < 4) return 'Đang thu thập...';
     const res = history.map(x => x.ket_qua);
     const last4 = res.slice(-4);
-    // Bệt (4 giống nhau)
     if (last4.every(v => v === last4[0])) return `🔥 Bệt ${last4[0]} (dài ≥4)`;
-    // 1-1
-    if (last4[0] !== last4[1] && last4[1] !== last4[2] && last4[2] !== last4[3] && last4[0] === last4[2] && last4[1] === last4[3]) 
-        return `🔁 Cầu 1-1 (${last4[3]} -> ${last4[3]==='Tài'?'Xỉu':'Tài'})`;
-    // 2-2
+    if (last4[0] !== last4[1] && last4[1] !== last4[2] && last4[2] !== last4[3] && last4[0] === last4[2] && last4[1] === last4[3])
+        return `🔁 Cầu 1-1 (${last4[3]} → ${last4[3]==='Tài'?'Xỉu':'Tài'})`;
     if (last4[0] === last4[1] && last4[2] === last4[3] && last4[0] !== last4[2])
         return `🔹 Cầu 2-2 (hiện ${last4[3]})`;
-    // Các mẫu khác có thể thêm
     return 'Không rõ cầu đặc biệt';
 }
 
-// --- CÁC CHIẾN LƯỢC DỰ ĐOÁN ---
+// ============= CÁC CHIẾN LƯỢC DỰ ĐOÁN =============
 function predictBet(history) {
     if (history.length < 4) return null;
     const last4 = history.slice(-4).map(x => x.ket_qua);
-    if (last4.every(v => v === last4[0])) return last4[0];
-    return null;
+    return last4.every(v => v === last4[0]) ? last4[0] : null;
 }
 
 function predictOneOne(history) {
@@ -95,11 +89,9 @@ function predictMarkov(history, order = 3) {
     const recentState = results.slice(-order).join(',');
     let taiCount = 0, xiuCount = 0;
     for (let i = 0; i < history.length - order; i++) {
-        const state = results.slice(i, i + order).join(',');
-        if (state === recentState) {
+        if (results.slice(i, i + order).join(',') === recentState) {
             const next = results[i + order];
-            if (next === 'Tài') taiCount++;
-            else xiuCount++;
+            next === 'Tài' ? taiCount++ : xiuCount++;
         }
     }
     if (taiCount + xiuCount === 0) return null;
@@ -113,7 +105,7 @@ function predictTrend(history) {
     return tai > recent20.length / 2 ? 'Tài' : 'Xỉu';
 }
 
-// --- TỔNG HỢP AI: Bỏ phiếu theo trọng số hiệu suất ---
+// ============= TỔNG HỢP AI (BỎ PHIẾU CÓ TRỌNG SỐ) =============
 function predictSuperAI(history) {
     const strategies = {
         'Bệt': predictBet(history),
@@ -129,24 +121,19 @@ function predictSuperAI(history) {
         if (pred) nextStrategyPredictions[name] = pred;
     }
 
-    // Tính trọng số = tỷ lệ đúng, mặc định 0.5 nếu chưa có dữ liệu
+    // Tính trọng số (tỉ lệ đúng), mặc định 0.5 nếu chưa có dữ liệu
     const weights = {};
     let totalWeight = 0;
     for (const [name, perf] of Object.entries(strategyPerformance)) {
-        if (perf.total > 0) {
-            weights[name] = perf.correct / perf.total;
-        } else {
-            weights[name] = 0.5; // Chưa có lịch sử, cho trọng số trung lập
-        }
+        weights[name] = perf.total > 0 ? perf.correct / perf.total : 0.5;
         totalWeight += weights[name];
     }
 
-    // Bỏ phiếu có trọng số
     let taiScore = 0, xiuScore = 0;
     for (const [name, pred] of Object.entries(strategies)) {
-        if (pred && weights[name]) {
-            if (pred === 'Tài') taiScore += weights[name];
-            else xiuScore += weights[name];
+        if (pred) {
+            const w = weights[name] || 0.5;
+            pred === 'Tài' ? taiScore += w : xiuScore += w;
         }
     }
 
@@ -154,11 +141,11 @@ function predictSuperAI(history) {
     const doTinCay = maxScore > 0 ? Math.round((maxScore / totalWeight) * 100) : 50;
     const duDoan = taiScore >= xiuScore ? 'Tài' : 'Xỉu';
 
-    // Xác định cầu
+    // Xác định cầu hiện tại
     const cau = detectPattern(history);
 
-    // Xác định chiến lược đang dùng (có trọng số cao nhất trong những chiến lược đưa ra dự đoán)
-    let bestStrategy = Object.entries(strategies)
+    // Xác định chiến lược quyết định (có trọng số cao nhất trong các chiến lược dự đoán đúng)
+    const bestStrategy = Object.entries(strategies)
         .filter(([n, p]) => p === duDoan && weights[n])
         .sort((a, b) => weights[b[0]] - weights[a[0]])[0];
     const chienLuoc = bestStrategy ? bestStrategy[0] : 'Default';
@@ -166,7 +153,7 @@ function predictSuperAI(history) {
     return { duDoan, doTinCay, cau, chienLuoc };
 }
 
-// --- QUẢN LÝ WEBSOCKET ---
+// ============= WEBSOCKET CONNECTION =============
 function heartbeat() {
     clearTimeout(heartbeatTimeout);
     heartbeatTimeout = setTimeout(() => {
@@ -208,44 +195,48 @@ function connectWebSocket() {
             if (!Array.isArray(data) || typeof data[1] !== 'object') return;
 
             const { cmd, sid, d1, d2, d3, gBB } = data[1];
-            if (sid) latestSid = sid;
 
             if (cmd === 1003 && gBB) {
                 if (!d1 || !d2 || !d3) return;
 
-                let activeSession = latestSid || (sessionHistory.length > 0 ? sessionHistory[sessionHistory.length - 1].phien + 1 : Date.now());
+                // Chống trùng lặp phiên
+                if (sid && sid === lastProcessedSid) return;
+
+                // Xác định số phiên (ưu tiên sid từ server)
+                let phien;
+                if (sid !== undefined && sid !== null) {
+                    phien = typeof sid === 'string' ? parseInt(sid) : sid;
+                    if (isNaN(phien)) phien = sessionHistory.length > 0 ? sessionHistory[sessionHistory.length - 1].phien + 1 : Date.now();
+                } else {
+                    phien = sessionHistory.length > 0 ? sessionHistory[sessionHistory.length - 1].phien + 1 : Date.now();
+                }
+                lastProcessedSid = sid; // Lưu để chống trùng
+
                 const total = d1 + d2 + d3;
                 const resultText = (total > 10) ? "Tài" : "Xỉu";
 
-                const sessionData = {
-                    phien: activeSession,
-                    xuc_xac_1: d1,
-                    xuc_xac_2: d2,
-                    xuc_xac_3: d3,
-                    tong: total,
-                    ket_qua: resultText
-                };
+                const sessionData = { phien, xuc_xac_1: d1, xuc_xac_2: d2, xuc_xac_3: d3, tong: total, ket_qua: resultText };
 
-                if (sessionHistory.length === 0 || sessionHistory[sessionHistory.length - 1].phien !== activeSession) {
+                // Lưu vào lịch sử (tránh trùng nếu lỗi)
+                if (sessionHistory.length === 0 || sessionHistory[sessionHistory.length - 1].phien !== phien) {
                     sessionHistory.push(sessionData);
                     if (sessionHistory.length > MAX_HISTORY) sessionHistory.shift();
                 }
 
-                // --- HỌC ONLINE: Đánh giá các chiến lược sau khi biết kết quả ---
-                if (Object.keys(nextStrategyPredictions).length > 0 && pendingPrediction) {
-                    const realResult = resultText;
+                // --- KIỂM TRA DỰ ĐOÁN TRƯỚC ĐÓ ---
+                if (pendingPrediction) {
                     predictionStats.total++;
-                    const isCorrect = pendingPrediction.duDoan === realResult;
+                    const isCorrect = pendingPrediction.duDoan === resultText;
                     if (isCorrect) predictionStats.correct++;
                     else predictionStats.wrong++;
 
                     predictionStats.history.unshift({
-                        phien: activeSession,
+                        phien: phien,
                         du_doan: pendingPrediction.duDoan,
-                        thuc_te: realResult,
+                        thuc_te: resultText,
                         trang_thai: isCorrect ? "✅ ĐÚNG" : "❌ SAI",
-                        cau: pendingPrediction.cau,
-                        chien_luoc: pendingPrediction.chienLuoc
+                        cau: pendingPrediction.cau || detectPattern(sessionHistory.slice(0, -1)), // cầu trước đó
+                        chien_luoc: pendingPrediction.chienLuoc || '--'
                     });
                     if (predictionStats.history.length > 50) predictionStats.history.pop();
 
@@ -253,45 +244,41 @@ function connectWebSocket() {
                     for (const [strategyName, pred] of Object.entries(nextStrategyPredictions)) {
                         if (strategyPerformance[strategyName]) {
                             strategyPerformance[strategyName].total++;
-                            if (pred === realResult) strategyPerformance[strategyName].correct++;
+                            if (pred === resultText) strategyPerformance[strategyName].correct++;
                         }
                     }
-
-                    // Reset
                     nextStrategyPredictions = {};
                 }
 
-                // --- DỰ ĐOÁN CHO PHIÊN TIẾP THEO ---
-                const nextPhien = activeSession + 1;
+                // --- DỰ ĐOÁN MỚI ---
                 const aiPrediction = predictSuperAI(sessionHistory);
                 pendingPrediction = {
-                    phien: nextPhien,
                     duDoan: aiPrediction.duDoan,
                     cau: aiPrediction.cau,
                     chienLuoc: aiPrediction.chienLuoc
                 };
 
-                // Cập nhật dữ liệu API
+                // Cập nhật dữ liệu JSON API
                 apiResponseData = {
                     ...sessionData,
                     lich_su_phien: sessionHistory
                 };
 
                 predictData = {
-                    phien: activeSession,
+                    phien: phien,
                     xuc_xac_1: d1,
                     xuc_xac_2: d2,
                     xuc_xac_3: d3,
                     tong: total,
                     ket_qua: resultText,
-                    phien_tiep_theo: nextPhien,
+                    phien_tiep_theo: phien + 1, // Dự đoán cho phiên kế tiếp (chỉ mang tính tương đối)
                     du_doan: aiPrediction.duDoan,
                     do_tin_cay: `${aiPrediction.doTinCay}%`,
                     cau_hien_tai: aiPrediction.cau,
                     chien_luoc_ai: aiPrediction.chienLuoc
                 };
-                
-                console.log(`[🎲] Phiên ${activeSession}: ${total} (${resultText}) | AI dự đoán: ${aiPrediction.duDoan} (${aiPrediction.doTinCay}%) | Cầu: ${aiPrediction.cau} | Chiến lược: ${aiPrediction.chienLuoc}`);
+
+                console.log(`[🎲] Phiên ${phien}: ${total} (${resultText}) | AI dự đoán: ${aiPrediction.duDoan} (${aiPrediction.doTinCay}%) | Cầu: ${aiPrediction.cau} | Chiến lược: ${aiPrediction.chienLuoc}`);
             }
         } catch (e) {
             console.error('[❌] Lỗi xử lý:', e.message);
@@ -311,21 +298,14 @@ function connectWebSocket() {
 }
 
 // --- REST API ROUTES ---
-
 app.get('/sunlon', (req, res) => res.json(apiResponseData));
 app.get('/predict', (req, res) => predictData ? res.json(predictData) : res.json({ error: "Chưa đủ dữ liệu" }));
-app.get('/ai-stats', (req, res) => res.json({
-    performance: strategyPerformance,
-    pending: pendingPrediction
-}));
+app.get('/ai-stats', (req, res) => res.json({ performance: strategyPerformance, pending: pendingPrediction }));
 
 // --- GIAO DIỆN /STATUS SIÊU VIP ---
 app.get('/status', (req, res) => {
-    const winRate = predictionStats.total > 0 
-        ? Math.round((predictionStats.correct / predictionStats.total) * 100) 
-        : 0;
+    const winRate = predictionStats.total > 0 ? Math.round((predictionStats.correct / predictionStats.total) * 100) : 0;
 
-    // Chuỗi hiển thị hiệu suất từng chiến lược
     let perfRows = '';
     for (const [name, perf] of Object.entries(strategyPerformance)) {
         const acc = perf.total > 0 ? Math.round((perf.correct / perf.total) * 100) : '--';
@@ -343,7 +323,7 @@ app.get('/status', (req, res) => {
         </tr>
     `).join('');
 
-    if(predictionStats.history.length === 0) {
+    if (predictionStats.history.length === 0) {
         tableRows = `<tr><td colspan="6" style="text-align:center; padding: 20px;">Hệ thống đang thu thập dữ liệu... Vui lòng chờ vài phiên.</td></tr>`;
     }
 
@@ -396,7 +376,7 @@ app.get('/status', (req, res) => {
     <body>
         <div class="container">
             <h1>🧠 AI SIÊU VIP DỰ ĐOÁN TÀI XỈU</h1>
-            <div class="subtitle">Tự học online - Tỉ lệ thắng tối ưu</div>
+            <div class="subtitle">Tự học online – Tỉ lệ thắng tối ưu</div>
 
             <div class="ai-panel">
                 <div class="ai-item">
