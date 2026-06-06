@@ -21,17 +21,28 @@ const WS_HEADERS = {
 
 const RECONNECT_DELAY = 1500;
 const PING_INTERVAL = 10000;
-const MAX_HISTORY = 120; // Tăng data base cho thuật toán VIP
+const MAX_HISTORY = 150; // Tăng để AI học sâu hơn
 
 // --- BIẾN TRẠNG THÁI ---
 let apiResponseData = { phien_hien_tai: null, lich_su_phien: [] };
 let predictData = null;
-let latestSid = null; // Cập nhật liên tục ID phiên chính xác
+let latestSid = null;
 const sessionHistory = [];
 
 let predictionStats = { total: 0, correct: 0, wrong: 0, history: [] };
 let pendingPrediction = null; 
 
+// --- AI: Đánh giá hiệu suất từng chiến lược (online learning) ---
+const strategyPerformance = {
+    'Bệt':      { correct: 0, total: 0 },
+    '1-1':      { correct: 0, total: 0 },
+    'Markov2':  { correct: 0, total: 0 },
+    'Markov3':  { correct: 0, total: 0 },
+    'Xu hướng':{ correct: 0, total: 0 }
+};
+let nextStrategyPredictions = {}; // Lưu dự đoán của từng chiến lược cho phiên kế tiếp
+
+// --- WEBSOCKET CONNECTION ---
 let ws = null;
 let pingInterval = null;
 let heartbeatTimeout = null;
@@ -45,53 +56,114 @@ const initialMessages = [
     [6, "MiniGame", "lobbyPlugin", { cmd: 10001 }]
 ];
 
-// --- THUẬT TOÁN DỰ ĐOÁN SIÊU VIP (ĐA LỚP) ---
-function predictNextVIP(history) {
-    if (history.length < 6) return { du_doan: "Chờ Data", do_tin_cay: 50 };
+// --- TIỆN ÍCH NHẬN DIỆN CẦU ---
+function detectPattern(history) {
+    if (history.length < 4) return 'Đang thu thập...';
+    const res = history.map(x => x.ket_qua);
+    const last4 = res.slice(-4);
+    // Bệt (4 giống nhau)
+    if (last4.every(v => v === last4[0])) return `🔥 Bệt ${last4[0]} (dài ≥4)`;
+    // 1-1
+    if (last4[0] !== last4[1] && last4[1] !== last4[2] && last4[2] !== last4[3] && last4[0] === last4[2] && last4[1] === last4[3]) 
+        return `🔁 Cầu 1-1 (${last4[3]} -> ${last4[3]==='Tài'?'Xỉu':'Tài'})`;
+    // 2-2
+    if (last4[0] === last4[1] && last4[2] === last4[3] && last4[0] !== last4[2])
+        return `🔹 Cầu 2-2 (hiện ${last4[3]})`;
+    // Các mẫu khác có thể thêm
+    return 'Không rõ cầu đặc biệt';
+}
 
+// --- CÁC CHIẾN LƯỢC DỰ ĐOÁN ---
+function predictBet(history) {
+    if (history.length < 4) return null;
+    const last4 = history.slice(-4).map(x => x.ket_qua);
+    if (last4.every(v => v === last4[0])) return last4[0];
+    return null;
+}
+
+function predictOneOne(history) {
+    if (history.length < 4) return null;
+    const last4 = history.slice(-4).map(x => x.ket_qua);
+    if (last4[0] !== last4[1] && last4[1] !== last4[2] && last4[2] !== last4[3] && last4[0] === last4[2] && last4[1] === last4[3])
+        return last4[3] === 'Tài' ? 'Xỉu' : 'Tài';
+    return null;
+}
+
+function predictMarkov(history, order = 3) {
+    if (history.length < order) return null;
     const results = history.map(x => x.ket_qua);
-    const last1 = results[results.length - 1];
-    const last2 = results[results.length - 2];
-    const last3 = results[results.length - 3];
-    const last4 = results[results.length - 4];
+    const recentState = results.slice(-order).join(',');
+    let taiCount = 0, xiuCount = 0;
+    for (let i = 0; i < history.length - order; i++) {
+        const state = results.slice(i, i + order).join(',');
+        if (state === recentState) {
+            const next = results[i + order];
+            if (next === 'Tài') taiCount++;
+            else xiuCount++;
+        }
+    }
+    if (taiCount + xiuCount === 0) return null;
+    return taiCount >= xiuCount ? 'Tài' : 'Xỉu';
+}
 
-    // Lớp 1: Nhận diện Cầu Bệt (Dài hơn 3 tay)
-    if (last1 === last2 && last2 === last3 && last3 === last4) {
-        return { du_doan: last1, do_tin_cay: 75 }; // Bám bệt
+function predictTrend(history) {
+    const recent20 = history.slice(-20).map(x => x.ket_qua);
+    if (recent20.length === 0) return null;
+    const tai = recent20.filter(r => r === 'Tài').length;
+    return tai > recent20.length / 2 ? 'Tài' : 'Xỉu';
+}
+
+// --- TỔNG HỢP AI: Bỏ phiếu theo trọng số hiệu suất ---
+function predictSuperAI(history) {
+    const strategies = {
+        'Bệt': predictBet(history),
+        '1-1': predictOneOne(history),
+        'Markov2': predictMarkov(history, 2),
+        'Markov3': predictMarkov(history, 3),
+        'Xu hướng': predictTrend(history)
+    };
+
+    // Lưu dự đoán của từng chiến lược cho phiên này để học sau
+    nextStrategyPredictions = {};
+    for (const [name, pred] of Object.entries(strategies)) {
+        if (pred) nextStrategyPredictions[name] = pred;
     }
 
-    // Lớp 2: Nhận diện Cầu 1-1 (Tài - Xỉu - Tài - Xỉu)
-    if (last1 !== last2 && last2 !== last3 && last3 !== last4) {
-        return { du_doan: last1 === 'Tài' ? 'Xỉu' : 'Tài', do_tin_cay: 70 }; // Bám cầu 1-1
+    // Tính trọng số = tỷ lệ đúng, mặc định 0.5 nếu chưa có dữ liệu
+    const weights = {};
+    let totalWeight = 0;
+    for (const [name, perf] of Object.entries(strategyPerformance)) {
+        if (perf.total > 0) {
+            weights[name] = perf.correct / perf.total;
+        } else {
+            weights[name] = 0.5; // Chưa có lịch sử, cho trọng số trung lập
+        }
+        totalWeight += weights[name];
     }
 
-    // Lớp 3: Pattern Matching (Dựa trên chuỗi 3 kết quả gần nhất)
-    const patternLength = 3;
-    const recentPattern = results.slice(-patternLength).join('-');
-    let t_count = 0; let x_count = 0;
-
-    for (let i = 0; i < history.length - patternLength; i++) {
-        const pattern = results.slice(i, i + patternLength).join('-');
-        if (pattern === recentPattern) {
-            const nextResult = results[i + patternLength];
-            if (nextResult === 'Tài') t_count++;
-            if (nextResult === 'Xỉu') x_count++;
+    // Bỏ phiếu có trọng số
+    let taiScore = 0, xiuScore = 0;
+    for (const [name, pred] of Object.entries(strategies)) {
+        if (pred && weights[name]) {
+            if (pred === 'Tài') taiScore += weights[name];
+            else xiuScore += weights[name];
         }
     }
 
-    const totalMatches = t_count + x_count;
-    if (totalMatches >= 2) {
-        const du_doan = t_count > x_count ? "Tài" : "Xỉu";
-        const do_tin_cay = Math.round((Math.max(t_count, x_count) / totalMatches) * 100);
-        return { du_doan, do_tin_cay: do_tin_cay < 55 ? 55 : do_tin_cay };
-    }
+    const maxScore = Math.max(taiScore, xiuScore);
+    const doTinCay = maxScore > 0 ? Math.round((maxScore / totalWeight) * 100) : 50;
+    const duDoan = taiScore >= xiuScore ? 'Tài' : 'Xỉu';
 
-    // Lớp 4: Fallback - Xu hướng tổng quan (Trend Analysis) 10 ván gần nhất
-    const recentTai = results.slice(-10).filter(r => r === 'Tài').length;
-    return {
-        du_doan: recentTai > 5 ? "Tài" : "Xỉu",
-        do_tin_cay: 55
-    };
+    // Xác định cầu
+    const cau = detectPattern(history);
+
+    // Xác định chiến lược đang dùng (có trọng số cao nhất trong những chiến lược đưa ra dự đoán)
+    let bestStrategy = Object.entries(strategies)
+        .filter(([n, p]) => p === duDoan && weights[n])
+        .sort((a, b) => weights[b[0]] - weights[a[0]])[0];
+    const chienLuoc = bestStrategy ? bestStrategy[0] : 'Default';
+
+    return { duDoan, doTinCay, cau, chienLuoc };
 }
 
 // --- QUẢN LÝ WEBSOCKET ---
@@ -136,18 +208,12 @@ function connectWebSocket() {
             if (!Array.isArray(data) || typeof data[1] !== 'object') return;
 
             const { cmd, sid, d1, d2, d3, gBB } = data[1];
-
-            // FIX: Cập nhật latestSid ngay khi có tín hiệu, không đợi đến khi quay xí ngầu
-            if (sid) {
-                latestSid = sid; 
-            }
+            if (sid) latestSid = sid;
 
             if (cmd === 1003 && gBB) {
                 if (!d1 || !d2 || !d3) return;
 
-                // Nếu không có sid, dùng id cuối + 1 để tránh null
                 let activeSession = latestSid || (sessionHistory.length > 0 ? sessionHistory[sessionHistory.length - 1].phien + 1 : Date.now());
-
                 const total = d1 + d2 + d3;
                 const resultText = (total > 10) ? "Tài" : "Xỉu";
 
@@ -160,35 +226,52 @@ function connectWebSocket() {
                     ket_qua: resultText
                 };
 
-                // Tránh lưu trùng lặp phiên (nếu server spam tin nhắn)
                 if (sessionHistory.length === 0 || sessionHistory[sessionHistory.length - 1].phien !== activeSession) {
                     sessionHistory.push(sessionData);
                     if (sessionHistory.length > MAX_HISTORY) sessionHistory.shift();
                 }
 
-                // --- KIỂM TRA DỰ ĐOÁN ---
-                if (pendingPrediction && pendingPrediction.phien === activeSession) {
+                // --- HỌC ONLINE: Đánh giá các chiến lược sau khi biết kết quả ---
+                if (Object.keys(nextStrategyPredictions).length > 0 && pendingPrediction) {
+                    const realResult = resultText;
                     predictionStats.total++;
-                    const isCorrect = pendingPrediction.du_doan === resultText;
+                    const isCorrect = pendingPrediction.duDoan === realResult;
                     if (isCorrect) predictionStats.correct++;
                     else predictionStats.wrong++;
 
                     predictionStats.history.unshift({
                         phien: activeSession,
-                        du_doan: pendingPrediction.du_doan,
-                        thuc_te: resultText,
-                        trang_thai: isCorrect ? "✅ ĐÚNG" : "❌ SAI"
+                        du_doan: pendingPrediction.duDoan,
+                        thuc_te: realResult,
+                        trang_thai: isCorrect ? "✅ ĐÚNG" : "❌ SAI",
+                        cau: pendingPrediction.cau,
+                        chien_luoc: pendingPrediction.chienLuoc
                     });
+                    if (predictionStats.history.length > 50) predictionStats.history.pop();
 
-                    if (predictionStats.history.length > 50) predictionStats.history.pop(); // Giữ 50 lịch sử trên UI
+                    // Cập nhật hiệu suất chiến lược
+                    for (const [strategyName, pred] of Object.entries(nextStrategyPredictions)) {
+                        if (strategyPerformance[strategyName]) {
+                            strategyPerformance[strategyName].total++;
+                            if (pred === realResult) strategyPerformance[strategyName].correct++;
+                        }
+                    }
+
+                    // Reset
+                    nextStrategyPredictions = {};
                 }
 
-                // --- TẠO DỰ ĐOÁN MỚI ---
+                // --- DỰ ĐOÁN CHO PHIÊN TIẾP THEO ---
                 const nextPhien = activeSession + 1;
-                const prediction = predictNextVIP(sessionHistory);
-                pendingPrediction = { phien: nextPhien, du_doan: prediction.du_doan };
+                const aiPrediction = predictSuperAI(sessionHistory);
+                pendingPrediction = {
+                    phien: nextPhien,
+                    duDoan: aiPrediction.duDoan,
+                    cau: aiPrediction.cau,
+                    chienLuoc: aiPrediction.chienLuoc
+                };
 
-                // --- CẬP NHẬT JSON API ---
+                // Cập nhật dữ liệu API
                 apiResponseData = {
                     ...sessionData,
                     lich_su_phien: sessionHistory
@@ -201,12 +284,14 @@ function connectWebSocket() {
                     xuc_xac_3: d3,
                     tong: total,
                     ket_qua: resultText,
-                    phien_hien_tai: nextPhien,
-                    du_doan: prediction.du_doan,
-                    do_tin_cay: `${prediction.do_tin_cay}%`
+                    phien_tiep_theo: nextPhien,
+                    du_doan: aiPrediction.duDoan,
+                    do_tin_cay: `${aiPrediction.doTinCay}%`,
+                    cau_hien_tai: aiPrediction.cau,
+                    chien_luoc_ai: aiPrediction.chienLuoc
                 };
                 
-                console.log(`[🎲] Phiên ${activeSession}: ${total} (${resultText}) | Dự đoán tiếp: ${prediction.du_doan} (${prediction.do_tin_cay}%)`);
+                console.log(`[🎲] Phiên ${activeSession}: ${total} (${resultText}) | AI dự đoán: ${aiPrediction.duDoan} (${aiPrediction.doTinCay}%) | Cầu: ${aiPrediction.cau} | Chiến lược: ${aiPrediction.chienLuoc}`);
             }
         } catch (e) {
             console.error('[❌] Lỗi xử lý:', e.message);
@@ -229,12 +314,23 @@ function connectWebSocket() {
 
 app.get('/sunlon', (req, res) => res.json(apiResponseData));
 app.get('/predict', (req, res) => predictData ? res.json(predictData) : res.json({ error: "Chưa đủ dữ liệu" }));
+app.get('/ai-stats', (req, res) => res.json({
+    performance: strategyPerformance,
+    pending: pendingPrediction
+}));
 
-// --- GIAO DIỆN HTML /STATUS ---
+// --- GIAO DIỆN /STATUS SIÊU VIP ---
 app.get('/status', (req, res) => {
     const winRate = predictionStats.total > 0 
         ? Math.round((predictionStats.correct / predictionStats.total) * 100) 
         : 0;
+
+    // Chuỗi hiển thị hiệu suất từng chiến lược
+    let perfRows = '';
+    for (const [name, perf] of Object.entries(strategyPerformance)) {
+        const acc = perf.total > 0 ? Math.round((perf.correct / perf.total) * 100) : '--';
+        perfRows += `<tr><td>${name}</td><td>${perf.total}</td><td>${perf.correct}</td><td>${acc}%</td></tr>`;
+    }
 
     let tableRows = predictionStats.history.map(item => `
         <tr>
@@ -242,12 +338,19 @@ app.get('/status', (req, res) => {
             <td class="${item.du_doan === 'Tài' ? 'tai' : 'xiu'}">${item.du_doan}</td>
             <td class="${item.thuc_te === 'Tài' ? 'tai' : 'xiu'}">${item.thuc_te}</td>
             <td class="status ${item.trang_thai.includes('ĐÚNG') ? 'correct' : 'wrong'}">${item.trang_thai}</td>
+            <td>${item.cau || '--'}</td>
+            <td>${item.chien_luoc || '--'}</td>
         </tr>
     `).join('');
 
     if(predictionStats.history.length === 0) {
-        tableRows = `<tr><td colspan="4" style="text-align:center; padding: 20px;">Hệ thống đang thu thập dữ liệu... Vui lòng chờ vài phiên.</td></tr>`;
+        tableRows = `<tr><td colspan="6" style="text-align:center; padding: 20px;">Hệ thống đang thu thập dữ liệu... Vui lòng chờ vài phiên.</td></tr>`;
     }
+
+    const currentCau = predictData ? predictData.cau_hien_tai : '...';
+    const nextPred = predictData ? predictData.du_doan : '...';
+    const confidence = predictData ? predictData.do_tin_cay : '...';
+    const strategyUsed = predictData ? predictData.chien_luoc_ai : '...';
 
     const html = `
     <!DOCTYPE html>
@@ -255,55 +358,80 @@ app.get('/status', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Thống Kê VIP - Hệ Thống Dự Đoán</title>
+        <title>AI Siêu VIP - Sun.Win</title>
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-            body { background-color: #121212; color: #ffffff; padding: 20px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            h1 { text-align: center; color: #f39c12; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 1px; }
+            body { background-color: #0d1117; color: #e6edf3; padding: 20px; }
+            .container { max-width: 1200px; margin: 0 auto; }
+            h1 { text-align: center; color: #f78166; margin-bottom: 10px; }
+            .subtitle { text-align: center; color: #8b949e; margin-bottom: 30px; font-size: 14px; }
+            .ai-panel { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; margin-bottom: 25px; display: flex; flex-wrap: wrap; gap: 20px; justify-content: space-around; align-items: center; }
+            .ai-item { text-align: center; }
+            .ai-label { font-size: 13px; color: #8b949e; margin-bottom: 5px; }
+            .ai-value { font-size: 24px; font-weight: bold; }
+            .tai { color: #58a6ff; }
+            .xiu { color: #f85149; }
             .stats-cards { display: flex; gap: 15px; margin-bottom: 30px; }
-            .card { background: #1e1e1e; padding: 20px; border-radius: 10px; flex: 1; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3); border: 1px solid #333; }
-            .card h3 { font-size: 14px; color: #aaaaaa; margin-bottom: 10px; }
+            .card { background: #161b22; padding: 20px; border-radius: 10px; flex: 1; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.2); border: 1px solid #30363d; }
+            .card h3 { font-size: 14px; color: #8b949e; margin-bottom: 10px; }
             .card .value { font-size: 28px; font-weight: bold; }
-            .text-green { color: #2ecc71; }
-            .text-red { color: #e74c3c; }
-            .text-blue { color: #3498db; }
-            .text-gold { color: #f1c40f; }
-            table { width: 100%; border-collapse: collapse; background: #1e1e1e; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-            thead { background: #2c3e50; }
-            th, td { padding: 15px; text-align: center; border-bottom: 1px solid #333; }
-            th { color: #f39c12; text-transform: uppercase; font-size: 14px; }
-            tr:hover { background: #2a2a2a; }
-            .tai { color: #3498db; font-weight: bold; }
-            .xiu { color: #e74c3c; font-weight: bold; }
-            .status.correct { color: #2ecc71; font-weight: bold; background: rgba(46, 204, 113, 0.1); border-radius: 5px; padding: 5px; }
-            .status.wrong { color: #e74c3c; font-weight: bold; background: rgba(231, 76, 60, 0.1); border-radius: 5px; padding: 5px; }
-            .auto-refresh { text-align: center; margin-top: 20px; font-size: 12px; color: #888; }
+            .text-green { color: #3fb950; }
+            .text-red { color: #f85149; }
+            .text-blue { color: #58a6ff; }
+            .text-gold { color: #d2991d; }
+            table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.2); border: 1px solid #30363d; }
+            thead { background: #1c2128; }
+            th, td { padding: 15px; text-align: center; border-bottom: 1px solid #30363d; font-size: 14px; }
+            th { color: #f78166; text-transform: uppercase; }
+            tr:hover { background: #1c2128; }
+            .status.correct { color: #3fb950; font-weight: bold; background: rgba(63, 185, 80, 0.1); border-radius: 5px; padding: 5px; }
+            .status.wrong { color: #f85149; font-weight: bold; background: rgba(248, 81, 73, 0.1); border-radius: 5px; padding: 5px; }
+            .auto-refresh { text-align: center; margin-top: 20px; font-size: 12px; color: #8b949e; }
+            .perf-table { margin-top: 30px; }
         </style>
         <script>
-            // Tự động reload trang mỗi 10 giây để cập nhật dữ liệu
             setInterval(() => window.location.reload(), 10000);
         </script>
     </head>
     <body>
         <div class="container">
-            <h1>🎲 Thống Kê Thuật Toán VIP</h1>
-            
+            <h1>🧠 AI SIÊU VIP DỰ ĐOÁN TÀI XỈU</h1>
+            <div class="subtitle">Tự học online - Tỉ lệ thắng tối ưu</div>
+
+            <div class="ai-panel">
+                <div class="ai-item">
+                    <div class="ai-label">Cầu hiện tại</div>
+                    <div class="ai-value" style="font-size:20px;">${currentCau}</div>
+                </div>
+                <div class="ai-item">
+                    <div class="ai-label">Dự đoán phiên tiếp</div>
+                    <div class="ai-value ${nextPred === 'Tài' ? 'tai' : 'xiu'}">${nextPred}</div>
+                </div>
+                <div class="ai-item">
+                    <div class="ai-label">Độ tin cậy</div>
+                    <div class="ai-value text-gold">${confidence}</div>
+                </div>
+                <div class="ai-item">
+                    <div class="ai-label">Chiến lược AI</div>
+                    <div class="ai-value" style="font-size:18px; color:#c9d1d9;">${strategyUsed}</div>
+                </div>
+            </div>
+
             <div class="stats-cards">
                 <div class="card">
                     <h3>Tổng Dự Đoán</h3>
                     <div class="value text-blue">${predictionStats.total}</div>
                 </div>
                 <div class="card">
-                    <h3>Dự Đoán Đúng</h3>
+                    <h3>Đúng</h3>
                     <div class="value text-green">${predictionStats.correct}</div>
                 </div>
                 <div class="card">
-                    <h3>Dự Đoán Sai</h3>
+                    <h3>Sai</h3>
                     <div class="value text-red">${predictionStats.wrong}</div>
                 </div>
                 <div class="card">
-                    <h3>Tỉ Lệ Thắng (Win Rate)</h3>
+                    <h3>Tỉ lệ Thắng</h3>
                     <div class="value text-gold">${winRate}%</div>
                 </div>
             </div>
@@ -311,27 +439,36 @@ app.get('/status', (req, res) => {
             <table>
                 <thead>
                     <tr>
-                        <th>Phiên Giao Dịch</th>
+                        <th>Phiên</th>
                         <th>Dự Đoán</th>
-                        <th>Kết Quả Thực Tế</th>
+                        <th>Kết Quả</th>
                         <th>Trạng Thái</th>
+                        <th>Cầu</th>
+                        <th>Chiến lược</th>
                     </tr>
                 </thead>
-                <tbody>
-                    ${tableRows}
-                </tbody>
+                <tbody>${tableRows}</tbody>
             </table>
-            
-            <div class="auto-refresh">🔄 Giao diện tự động cập nhật sau mỗi 10 giây</div>
+
+            <div class="perf-table">
+                <h2 style="color:#f78166; margin: 30px 0 15px;">📊 Hiệu suất từng chiến lược</h2>
+                <table>
+                    <thead>
+                        <tr><th>Chiến lược</th><th>Số lần dùng</th><th>Đúng</th><th>Độ chính xác</th></tr>
+                    </thead>
+                    <tbody>${perfRows}</tbody>
+                </table>
+            </div>
+
+            <div class="auto-refresh">🔄 Tự động cập nhật mỗi 10 giây</div>
         </div>
     </body>
     </html>
     `;
-
     res.send(html);
 });
 
-app.get('/', (req, res) => res.send(`<p>Vào <a href="/status">/status</a> để xem UI thống kê.</p>`));
+app.get('/', (req, res) => res.send(`<p>Vào <a href="/status">/status</a> để xem giao diện AI.</p>`));
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[🌐] Server chạy tại cổng ${PORT}`);
